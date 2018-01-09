@@ -11,6 +11,7 @@
 #include "mozilla/dom/ContentChild.h"
 #include "mozilla/ipc/FileDescriptor.h"
 #include "mozilla/Logging.h"
+#include "mozilla/media/MediaUtils.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/Services.h"
 #include "mozilla/Sprintf.h"
@@ -71,9 +72,6 @@ namespace {
 ////////////////////////////////////////////////////////////////////////////////
 // Cubeb Sound Server Thread
 void* sServerHandle = nullptr;
-
-// Initialized during early startup, protected by sMutex.
-ipc::FileDescriptor sIPCConnection;
 
 static bool
 StartSoundServer()
@@ -401,22 +399,33 @@ void InitBrandName()
 }
 
 #ifdef MOZ_CUBEB_REMOTING
-void InitAudioIPCConnection()
+ipc::FileDescriptor GetAudioIPCConnection()
 {
-  MOZ_ASSERT(NS_IsMainThread());
-  auto contentChild = dom::ContentChild::GetSingleton();
-  auto promise = contentChild->SendCreateAudioIPCConnection();
-  promise->Then(AbstractThread::GetCurrent(),
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  nsCOMPtr<nsISerialEventTarget> eventTarget = SystemGroup::EventTargetFor(TaskCategory::Other);
+
+  RefPtr<dom::ContentChild::CreateAudioIPCConnectionPromise> (dom::ContentChild::*fn)() =
+    &dom::ContentChild::SendCreateAudioIPCConnection;
+  auto promise = InvokeAsync(eventTarget,
+                             dom::ContentChild::GetSingleton(),
+                             __func__,
+                             fn);
+
+  ipc::FileDescriptor ipcConnection;
+  promise->Then(eventTarget,
                 __func__,
-                [](ipc::FileDescriptor aFD) {
-                  StaticMutexAutoLock lock(sMutex);
-                  MOZ_ASSERT(!sIPCConnection.IsValid());
-                  sIPCConnection = aFD;
+                [&](ipc::FileDescriptor aFD) {
+                  ipcConnection = aFD;
                 },
                 [](mozilla::ipc::ResponseRejectReason aReason) {
-                  MOZ_LOG(gCubebLog, LogLevel::Error, ("SendCreateAudioIPCConnection failed: %d",
+                  MOZ_LOG(gCubebLog, LogLevel::Error, ("GetAudioIPCConnection failed: %d",
                                                        int(aReason)));
                 });
+
+  media::Await(eventTarget.forget(), promise);
+
+  return ipcConnection;
 }
 #endif
 
@@ -450,22 +459,21 @@ cubeb* GetCubebContextUnlocked()
   }
 
 #ifdef MOZ_CUBEB_REMOTING
-  if (sCubebSandbox) {
-    if (XRE_IsParentProcess()) {
-      // TODO: Don't use audio IPC when within the same process.
-      MOZ_ASSERT(!sIPCConnection.IsValid());
-      sIPCConnection = CreateAudioIPCConnection();
-    } else {
-      MOZ_DIAGNOSTIC_ASSERT(sIPCConnection.IsValid());
-    }
-  }
 
   MOZ_LOG(gCubebLog, LogLevel::Info, ("%s: %s", PREF_CUBEB_SANDBOX, sCubebSandbox ? "true" : "false"));
 
-  int rv = sCubebSandbox
-    ? audioipc_client_init(&sCubebContext, sBrandName,
-                           sIPCConnection.ClonePlatformHandle().release())
-    : cubeb_init(&sCubebContext, sBrandName, sCubebBackendName.get());
+  int rv;
+  if (sCubebSandbox) {
+    // TODO: Don't use audio IPC when within the same process.
+    ipc::FileDescriptor ipcConnection = XRE_IsParentProcess()
+      ? CreateAudioIPCConnection()
+      : GetAudioIPCConnection();
+
+    rv = audioipc_client_init(&sCubebContext, sBrandName,
+                              ipcConnection.ClonePlatformHandle().release());
+  } else {
+    rv = cubeb_init(&sCubebContext, sBrandName, sCubebBackendName.get());
+  }
 #else // !MOZ_CUBEB_REMOTING
   int rv = cubeb_init(&sCubebContext, sBrandName, sCubebBackendName.get());
 #endif // MOZ_CUBEB_REMOTING
@@ -558,12 +566,6 @@ void InitLibrary()
   AbstractThread::MainThread()->Dispatch(
     NS_NewRunnableFunction("CubebUtils::InitLibrary", &InitBrandName));
 #endif
-#ifdef MOZ_CUBEB_REMOTING
-  if (sCubebSandbox && XRE_IsContentProcess()) {
-    AbstractThread::MainThread()->Dispatch(
-      NS_NewRunnableFunction("CubebUtils::InitLibrary", &InitAudioIPCConnection));
-  }
-#endif
 }
 
 void ShutdownLibrary()
@@ -586,7 +588,6 @@ void ShutdownLibrary()
   sCubebState = CubebState::Shutdown;
 
 #ifdef MOZ_CUBEB_REMOTING
-  sIPCConnection = ipc::FileDescriptor();
   ShutdownSoundServer();
 #endif
 }
